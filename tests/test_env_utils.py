@@ -30,14 +30,14 @@ def test_parse_env_positive_float_uses_default_when_unset(monkeypatch):
     env = _load_env_module(monkeypatch)
     monkeypatch.delenv("MILES_MAX_RESIDUAL_GPU_MEM_GB", raising=False)
 
-    assert env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0) == 10.0
+    assert env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0) == 2.0
 
 
 def test_parse_env_positive_float_reads_override(monkeypatch):
     env = _load_env_module(monkeypatch)
     monkeypatch.setenv("MILES_MAX_RESIDUAL_GPU_MEM_GB", "40.5")
 
-    assert env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0) == 40.5
+    assert env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0) == 40.5
 
 
 def test_parse_env_positive_float_rejects_non_positive(monkeypatch):
@@ -45,7 +45,7 @@ def test_parse_env_positive_float_rejects_non_positive(monkeypatch):
     monkeypatch.setenv("MILES_MAX_RESIDUAL_GPU_MEM_GB", "0")
 
     with pytest.raises(RuntimeError, match="must be > 0"):
-        env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0)
+        env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0)
 
 
 def test_parse_env_positive_float_rejects_non_numeric(monkeypatch):
@@ -53,4 +53,4 @@ def test_parse_env_positive_float_rejects_non_numeric(monkeypatch):
     monkeypatch.setenv("MILES_MAX_RESIDUAL_GPU_MEM_GB", "not-a-number")
 
     with pytest.raises(RuntimeError, match="must be a number"):
-        env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0)
+        env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0)

@@ -581,7 +581,7 @@ class MilesPipeline:
         # models or tighter environments can override it without changing
         # the driver CLI surface.
         target_residual_gb = parse_env_positive_float(
-            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
         )
         deadline2 = time.time() + float(timeout_s)
         last_max_used_gb: Optional[float] = None
