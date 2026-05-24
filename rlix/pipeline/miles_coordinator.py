@@ -38,7 +38,7 @@ from rlix.protocol.types import (
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.utils.env import pipeline_identity_env_vars
+from rlix.utils.env import parse_env_positive_float, pipeline_identity_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -435,8 +435,19 @@ class MilesCoordinator(Coordinator):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
-        # RPC outside the lock.
-        ray.get(rollout_manager.shrink_engines.remote(sorted(engine_indices)))
+        # RPC outside the lock. Use SGLang's server-side residual allocation
+        # check (weight + kvcache + graph) after release_memory_occupation; it
+        # is narrower than raw nvidia-smi used memory and avoids counting CUDA /
+        # Ray / process runtime overhead as model residue.
+        residual_threshold_gb = parse_env_positive_float(
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
+        )
+        ray.get(
+            rollout_manager.shrink_engines.remote(
+                sorted(engine_indices),
+                post_sleep_vram_threshold_gb=residual_threshold_gb,
+            )
+        )
         # Commit under lock.
         with self._resize_sync_lock:
             self._active_engine_indices -= engine_indices

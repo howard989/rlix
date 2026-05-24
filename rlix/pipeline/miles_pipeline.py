@@ -51,7 +51,6 @@ from rlix.protocol.types import (
     SCHEDULER_ACTOR_NAME,
     get_pipeline_namespace,
 )
-from rlix.utils.env import parse_env_positive_float
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -504,16 +503,14 @@ class MilesPipeline:
 
     def _wait_for_overlap_engines_offloaded(self, allocated_train_gpus, *, timeout_s: float = 60.0) -> None:
         """After scheduler grants actor_train, poll the rollout manager
-        until the engines on overlap GPUs have transitioned to ``offloaded``
-        AND OS-reported residual GPU memory is low enough. SGLang's HTTP
-        ``/release_memory_occupation`` 200 OK + state="offloaded" do not
-        by themselves guarantee the CUDA driver has returned the memory
-        to the OS pool — the wake_up in the next-process train actor
-        would then OOM. Verify actual residual GPU usage by parsing
-        ``nvidia-smi --query-gpu=memory.used`` on the same node, since
-        miles' single-node smoke topology has driver+actors+engines all
-        on the head node and ``CUDA_VISIBLE_DEVICES`` is the per-actor
-        slice of the shared physical pool.
+        until the engines on overlap GPUs have transitioned to ``offloaded``.
+
+        The hard residual-allocation safety check runs during
+        ``RolloutManager.shrink_engines`` via SGLang ``/server_info``
+        (weight + kvcache + graph). This method only waits for the state
+        transition and logs raw OS-level ``nvidia-smi memory.used`` as a
+        diagnostic, because process-level GPU usage includes CUDA / Ray /
+        runtime overhead beyond SGLang's offloadable allocations.
         """
         rollout_manager = getattr(self, "_rollout_manager", None)
         if rollout_manager is None:
@@ -574,50 +571,21 @@ class MilesPipeline:
                 timeout_s, target_indices, uniq,
             )
 
-        # Phase 2: probe nvidia-smi for OS-level residual used memory on
-        # the overlap GPU IDs. A max-used threshold is portable across GPU
-        # models; a min-free threshold changes meaning with total VRAM.
-        # The default is intentionally conservative for smoke, and larger
-        # models or tighter environments can override it without changing
-        # the driver CLI surface.
-        target_residual_gb = parse_env_positive_float(
-            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
-        )
-        deadline2 = time.time() + float(timeout_s)
-        last_max_used_gb: Optional[float] = None
-        nvidia_smi_unavail_count = 0
-        while time.time() < deadline2:
-            max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
-            if max_used_gb is None:
-                # F5 (m11-review.review-report.md section 2): nvidia-smi unavailable
-                # or unparseable. Log at INFO so operators see the fallback
-                # without flipping log levels. If this fires repeatedly across
-                # sessions, it is a hardware / image regression worth investigating
-                # (driver missing, nvidia-smi path changed, etc.).
-                nvidia_smi_unavail_count += 1
-                logger.info(
-                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe "
-                    "unavailable (count=%d); falling back to 3s grace sleep",
-                    nvidia_smi_unavail_count,
-                )
-                time.sleep(3.0)
-                return
-            last_max_used_gb = max_used_gb
-            if max_used_gb <= target_residual_gb:
-                logger.info(
-                    "_wait_for_overlap_engines_offloaded: OS-level GPU mem residual "
-                    "used max=%.2f GB across overlap GPUs %s "
-                    "(residual_target=%.1f GB)",
-                    max_used_gb, target_gpu_ids, target_residual_gb,
-                )
-                return
-            time.sleep(0.5)
-        logger.warning(
-            "_wait_for_overlap_engines_offloaded: residual-used timeout after %.1fs; "
-            "max_used_gb=%.2f above %.1f GB target on GPUs %s — wake_up may OOM",
-            timeout_s,
-            last_max_used_gb if last_max_used_gb is not None else float("nan"),
-            target_residual_gb,
+        # Phase 2: log raw nvidia-smi used memory as diagnostics only.
+        # The hard safety check now runs inside RolloutManager.shrink_engines
+        # via SGLang /server_info (weight + kvcache + graph), which is a
+        # narrower residual-allocation signal than process-level GPU usage.
+        max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
+        if max_used_gb is None:
+            logger.info(
+                "_wait_for_overlap_engines_offloaded: nvidia-smi probe unavailable; "
+                "server-side SGLang residual check already ran during shrink"
+            )
+            return
+        logger.info(
+            "_wait_for_overlap_engines_offloaded: OS-level GPU mem used max=%.2f GB "
+            "across overlap GPUs %s (diagnostic; SGLang residual assert is the gate)",
+            max_used_gb,
             target_gpu_ids,
         )
 
