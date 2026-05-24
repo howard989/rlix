@@ -442,11 +442,18 @@ class MilesCoordinator(Coordinator):
         residual_threshold_gb = parse_env_positive_float(
             "MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0
         )
-        ray.get(
+        shrunk = ray.get(
             rollout_manager.shrink_engines.remote(
                 sorted(engine_indices),
                 post_sleep_vram_threshold_gb=residual_threshold_gb,
             )
+        )
+        logger.info(
+            "[MilesCoordinator] shrink_engines residual allocation check passed "
+            "pipeline_id=%s engine_indices=%s threshold=%.1f GB",
+            self._pipeline_id,
+            sorted(shrunk),
+            residual_threshold_gb,
         )
         # Commit under lock.
         with self._resize_sync_lock:
