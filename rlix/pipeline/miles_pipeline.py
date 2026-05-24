@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -333,6 +334,34 @@ class MilesPipeline:
         logger.info("[MilesPipeline] phaseB step4: get_engine_count done count=%d", engine_count)
         self._declared_engine_count = engine_count
 
+        # M11.2 Option β / Gate 4(c): when MILES_INIT_DEFER_ADD_WORKER=1,
+        # engines came up state="loading" (rollout.py:_init_engine_info_table
+        # branch) with router /add_worker skipped. Drive finish_init_offload
+        # immediately so engines transition loading → offloaded and VRAM is
+        # released via release_memory_occupation. Subsequent
+        # _expand_workers cycles hit the F40 Runtime branch
+        # (miles_coordinator.py:498-512) which does wake → sync →
+        # activate_routing (with /add_worker re-registration). This
+        # implements Gate 4(c) "initializes all SGLang engines, then
+        # offloads all without routing or sync" without rebuilding the
+        # full F22 shell-init architecture (deferred to M11.5).
+        full_engine_indices = list(range(engine_count))
+        option_beta = os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1"
+        if option_beta:
+            logger.info(
+                "[MilesPipeline] phaseB step4a: finish_init_offload start "
+                "(Option β / Gate 4(c)) engines=%s",
+                full_engine_indices,
+            )
+            ray.get(
+                self._rollout_manager.finish_init_offload.remote(
+                    full_engine_indices
+                )
+            )
+            logger.info(
+                "[MilesPipeline] phaseB step4a: finish_init_offload done"
+            )
+
         # Wire the train group to the rollout manager so rank 0 can push
         # train_parallel_config into RolloutManager during setup. Standalone
         # does this in create_training_models; rlix mode runs it here, after
@@ -340,6 +369,23 @@ class MilesPipeline:
         logger.info("[MilesPipeline] phaseB step4b: set_rollout_manager start")
         self._run_async(self._train_group.set_rollout_manager(self._rollout_manager))
         logger.info("[MilesPipeline] phaseB step4b: set_rollout_manager done")
+
+        # Inject the RLix progress hook into the rollout manager. Without
+        # this, every ``begin_progress_batch`` / ``bump_completed`` from the
+        # rollout function lands on a :class:`NoOpRLixHooks` and the central
+        # scheduler never sees rollout demand — gap-ratio then has no signal
+        # to wake engines for rollout N+1 after the prior ``_after_training``
+        # released ``actor_train``, and the loop hangs on
+        # ``await rollout_data`` indefinitely.
+        from rlix.pipeline.miles_hooks import MilesRLixHooks
+
+        rlix_hooks = MilesRLixHooks(
+            coordinator_handle=self._coordinator_handle,
+            pipeline_id=self._pipeline_id,
+        )
+        logger.info("[MilesPipeline] phaseB step4c: set_rlix_hooks start")
+        ray.get(self._rollout_manager.set_rlix_hooks.remote(rlix_hooks))
+        logger.info("[MilesPipeline] phaseB step4c: set_rlix_hooks done")
 
         # F107 / X2: register handles. F22 (relaxed): in M11.1 single-pipeline
         # this happens after the manager exists; the dual-pipeline-shell-init
@@ -352,31 +398,71 @@ class MilesPipeline:
             )
         )
         logger.info("[MilesPipeline] phaseB step5: register_model_update_resources done")
-        # All engines came up active via start_rollout_servers; bootstrap
-        # the full set as the active group. X3 / F19 still applies — this
-        # is the SINGLE bootstrap call.
-        full_engine_indices = list(range(engine_count))
-        logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines start")
+
+        # bootstrap_active_engines: under Option β the post-INIT active
+        # set is EMPTY (engines offloaded, router empty); F40 Runtime
+        # branch fills it lazily on first _expand_workers. Standalone
+        # (env unset) keeps the original full-set bootstrap.
+        bootstrap_set = frozenset() if option_beta else frozenset(full_engine_indices)
+        logger.info(
+            "[MilesPipeline] phaseB step6: bootstrap_active_engines start "
+            "set=%s (option_beta=%s)",
+            sorted(bootstrap_set), option_beta,
+        )
         ray.get(
             self._coordinator_handle.bootstrap_active_engines.remote(
-                frozenset(full_engine_indices)
+                bootstrap_set
             )
         )
         logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines done")
 
         active = ray.get(self._coordinator_handle.get_active_engines.remote())
-        if set(active) != set(full_engine_indices):
+        expected_active = set(bootstrap_set)
+        if set(active) != expected_active:
             raise RuntimeError(
-                f"post-INIT active set mismatch: declared={full_engine_indices}, "
+                f"post-INIT active set mismatch: declared={sorted(expected_active)}, "
                 f"got={sorted(active)}"
             )
 
-        # Push base v=-1 weights to the active engines now that the cache
-        # is built (Phase A Step 4) and the active set is known. Driver no
-        # longer needs to call this — keeps init self-contained.
-        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) start")
-        ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
-        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) done")
+        if option_beta:
+            # Codex KT review Q5-a: assert router enabled_workers is empty
+            # at end of Phase B INIT. Catches any code path that adds a
+            # worker behind our back (the env-gated _init_normal skip
+            # could be defeated by a future change).
+            enabled = ray.get(
+                self._rollout_manager.get_router_enabled_workers.remote()
+            )
+            if enabled:
+                raise RuntimeError(
+                    f"Phase B INIT contract violated: router "
+                    f"enabled_workers={enabled} not empty after "
+                    f"finish_init_offload (Option β / Gate 4(c))"
+                )
+            logger.info(
+                "[MilesPipeline] phaseB step6.5: router enabled_workers "
+                "empty post-INIT (invariant OK)"
+            )
+            # Skip step 7 sync_base_weights_to_active(-1): F40 Runtime
+            # branch will sync on first expand using cache_ready_step=-1
+            # already published in Phase A step 6.6.
+            logger.info(
+                "[MilesPipeline] phaseB step7: skipped under Option β — "
+                "F40 Runtime will sync at v=-1 on first expand"
+            )
+        else:
+            # Push base v=-1 weights to the active engines now that the
+            # cache is built (Phase A Step 4) and the active set is
+            # known. Driver no longer needs to call this — keeps init
+            # self-contained.
+            logger.info(
+                "[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) "
+                "start"
+            )
+            ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
+            logger.info(
+                "[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) "
+                "done"
+            )
 
         # Step 8: transition actor_infer from INITIALIZATION → GENERATION
         # priority. INITIALIZATION is the highest priority and the
@@ -499,14 +585,20 @@ class MilesPipeline:
         )
         deadline2 = time.time() + float(timeout_s)
         last_max_used_gb: Optional[float] = None
+        nvidia_smi_unavail_count = 0
         while time.time() < deadline2:
             max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
             if max_used_gb is None:
-                # nvidia-smi unavailable or unparseable — fall back to a
-                # short grace sleep so we don't spin forever.
-                logger.warning(
-                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe unavailable; "
-                    "falling back to 3s grace sleep"
+                # F5 (m11-review.review-report.md section 2): nvidia-smi unavailable
+                # or unparseable. Log at INFO so operators see the fallback
+                # without flipping log levels. If this fires repeatedly across
+                # sessions, it is a hardware / image regression worth investigating
+                # (driver missing, nvidia-smi path changed, etc.).
+                nvidia_smi_unavail_count += 1
+                logger.info(
+                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe "
+                    "unavailable (count=%d); falling back to 3s grace sleep",
+                    nvidia_smi_unavail_count,
                 )
                 time.sleep(3.0)
                 return
@@ -611,17 +703,20 @@ class MilesPipeline:
         # Coordinator drives sync_base_weights_to_active under its
         # resize lock; pipeline NEVER calls service / finalize /
         # set_weight_version directly (F05).
-        ray.get(
-            self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
-        )
-        # Release the actor_train allocation back to the scheduler so
-        # other pipelines can step. R11-F1: only flip the ledger flag
-        # after a SUCCESSFUL release.
-        released = self._notify_release_cluster_gpus(
-            cluster_id=self._actor_train_cluster_id, global_step=int(step)
-        )
-        if released:
-            self._actor_train_allocated = False
+        try:
+            ray.get(
+                self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
+            )
+        finally:
+            # Release the actor_train allocation back to the scheduler so
+            # other pipelines can step even if weight sync fails after the
+            # train actor has offloaded. R11-F1: only flip the ledger flag
+            # after a SUCCESSFUL release.
+            released = self._notify_release_cluster_gpus(
+                cluster_id=self._actor_train_cluster_id, global_step=int(step)
+            )
+            if released:
+                self._actor_train_allocated = False
 
     # ------------------------------------------------------------------
     # M4 minimal hard cleanup
@@ -725,6 +820,72 @@ class MilesPipeline:
 
     def after_training(self, step: int) -> None:
         return self._after_training(step)
+
+    def _release_train_only(self, step: int) -> None:
+        """Cleanup-only release path used when ``train()`` raises mid-step.
+
+        ``_after_training`` builds + publishes a CPU bucket BEFORE the
+        scheduler release; calling it on a partial train would
+        double-publish or crash on un-onloaded weights. This shim skips
+        ``build_cpu_bucket_cache`` / ``offload`` / ``sync_base_weights_to_active``
+        and only releases the ``actor_train`` allocation back to the
+        scheduler so peer pipelines can step.
+        """
+        if not self._initialized:
+            return
+        if not self._actor_train_allocated:
+            return
+        released = self._notify_release_cluster_gpus(
+            cluster_id=self._actor_train_cluster_id, global_step=int(step)
+        )
+        if released:
+            self._actor_train_allocated = False
+
+    def release_train_only(self, step: int) -> None:
+        return self._release_train_only(step)
+
+    def signal_rollout_demand(self, rollout_id: int, step_target: int) -> None:
+        """Pre-signal scheduler that this pipeline has fresh demand for the
+        upcoming rollout, so the gap-ratio planner can wake actor_infer
+        engines BEFORE the rollout function's ``begin_progress_batch`` fires.
+
+        Calls ``scheduler.request_gpus(actor_infer, GENERATION,
+        step_target_estimate=N)`` — writes
+        ``rollout_open_pipelines[pipeline_id] = N`` on the durable
+        registry (dfd53f3). When the existing GENERATION allocation
+        still has ``active_dp_ranks``, the RPC short-circuits and
+        returns the existing GPU list. When ``active_dp_ranks == set()``
+        (post-``_after_training`` rollout boundary), it enqueues a
+        pending request and blocks until gap-ratio activates at least
+        one DP worker — giving the rollout function a guaranteed-awake
+        engine for its first sample dispatch.
+        """
+        if not self._initialized:
+            return
+        if step_target <= 0:
+            return
+        scheduler = self._get_scheduler_handle(silent_on_missing=True)
+        if scheduler is None:
+            return
+        try:
+            ray.get(
+                scheduler.request_gpus.remote(
+                    cluster_id=self._actor_infer_cluster_id,
+                    priority=Priority.GENERATION,
+                    global_step=int(rollout_id),
+                    step_target_estimate=int(step_target),
+                ),
+                timeout=60.0,
+            )
+            logger.info(
+                "[MilesPipeline] signal_rollout_demand rollout_id=%d step_target=%d pipeline_id=%s",
+                int(rollout_id), int(step_target), self._pipeline_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "signal_rollout_demand(rollout_id=%d) failed: %r",
+                int(rollout_id), exc,
+            )
 
     # ------------------------------------------------------------------
     # Helpers
