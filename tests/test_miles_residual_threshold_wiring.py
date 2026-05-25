@@ -47,3 +47,22 @@ def test_miles_shrink_uses_server_side_residual_threshold() -> None:
         )
         for node in ast.walk(shrink_fn)
     ), "shrink_engines must receive post_sleep_vram_threshold_gb"
+
+
+def test_miles_coordinator_forwards_option_beta_env_var() -> None:
+    source = (REPO_ROOT / "rlix" / "pipeline" / "miles_coordinator.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+
+    build_env_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_pipeline_env_vars"
+    )
+
+    assert any(
+        isinstance(node, ast.Constant)
+        and node.value == "MILES_INIT_DEFER_ADD_WORKER"
+        for node in ast.walk(build_env_fn)
+    ), "_build_pipeline_env_vars must forward MILES_INIT_DEFER_ADD_WORKER"
